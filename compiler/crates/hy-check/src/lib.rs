@@ -165,7 +165,11 @@ fn build_tables(ck: &mut Checker<'_>) {
                 );
             }
             Decl::Fn(f) => {
-                ck.fns.insert(f.name.clone(), f);
+                // Only top-level functions belong in `ck.fns` (methods have a
+                // receiver and must not overwrite or impersonate top-level fns).
+                if f.receiver.is_none() {
+                    ck.fns.insert(f.name.clone(), f);
+                }
             }
             Decl::Enum(_) => {}
             Decl::TypeAlias(_) => {}
@@ -183,12 +187,25 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     // environment seed: receiver + params
     let mut st = FnState::default();
     if let Some(r) = &f.receiver {
-        let shape = ck.shape_of_type(&r.ty);
+        let base_shape = ck.shape_of_type(&r.ty);
+        let shape = if r.is_pointer {
+            TypeShape::Pointer(Box::new(base_shape))
+        } else {
+            base_shape
+        };
+        let ty = if r.is_pointer {
+            Some(hy_syntax::TypeExpr::Pointer {
+                to: Box::new(r.ty.clone()),
+                span: r.ty.span(),
+            })
+        } else {
+            Some(r.ty.clone())
+        };
         st.env.insert(
             r.name.clone(),
             Binding {
                 shape,
-                ty: Some(r.ty.clone()),
+                ty,
                 immutable: false,
                 managed_taint: false,
                 moved: None,
