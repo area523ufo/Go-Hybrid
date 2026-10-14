@@ -263,21 +263,23 @@ impl<'a> Checker<'a> {
         idx: usize,
         managed: bool,
     ) {
-        // A3 loan creation: `svc := &e.services[existing]`
-        if l.names.len() == 1 && l.values.len() == 1 {
-            if let Some(path) = walk::addr_of_index_base_path(&l.values[0]) {
-                let binding = l.names[0].clone();
-                let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
-                st.loans.push(Loan {
-                    target: LoanTarget::MapSlot {
-                        binding: binding.clone(),
-                        path,
-                    },
-                    created: idx,
-                    last,
-                    span: l.values[0].span(),
-                    desc: format!("`{} := {}`", binding, l.values[0].render()),
-                });
+        // A3 loan creation: `svc := &e.services[existing]` (including parallel defines)
+        if l.names.len() == l.values.len() {
+            for (name, val) in l.names.iter().zip(l.values.iter()) {
+                if let Some(path) = walk::addr_of_index_base_path(val) {
+                    let binding = name.clone();
+                    let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
+                    st.loans.push(Loan {
+                        target: LoanTarget::MapSlot {
+                            binding: binding.clone(),
+                            path,
+                        },
+                        created: idx,
+                        last,
+                        span: val.span(),
+                        desc: format!("`{} := {}`", binding, val.render()),
+                    });
+                }
             }
         }
 
@@ -304,8 +306,17 @@ impl<'a> Checker<'a> {
         if l.values.len() == 1 && l.names.len() > 1 {
             // multi-value define from one expression
             let shapes = self.multi_value_shapes(st, &l.values[0], l.names.len());
-            for (name, shape) in l.names.iter().zip(shapes) {
-                self.define_binding(st, name, shape, None, immutable, managed);
+            let tys = self.multi_value_tys(st, &l.values[0], l.names.len());
+            for ((name, shape), ty) in l.names.iter().zip(shapes).zip(tys) {
+                let (shape, ty) = match (&l.ty, shape) {
+                    (Some(t), TypeShape::Unknown) => (self.shape_of_type(t), Some(t.clone())),
+                    (_, s) => (s, ty),
+                };
+                let is_view = matches!(shape, TypeShape::BorrowHandle(_));
+                self.define_binding(st, name, shape, ty, immutable, managed);
+                if is_view {
+                    self.extend_call_loans_to_view(st, &l.values[0], name, idx);
+                }
             }
         } else {
             for (name, value) in l.names.iter().zip(l.values.iter()) {
@@ -451,27 +462,24 @@ impl<'a> Checker<'a> {
             }
         }
 
-        // A6: a borrow stored into a struct field
-        if values.len() == 1 {
-            let v = &values[0];
-            for t in targets {
+        // A6: a borrow stored into a struct field (single, parallel, or multi-return)
+        if targets.len() == values.len() {
+            for (t, v) in targets.iter().zip(values.iter()) {
                 if matches!(t.kind, PlaceKind::Field { .. }) {
                     let is_borrow = as_addr_of(v).is_some()
                         || matches!(self.shape_of_expr(st, v), TypeShape::BorrowHandle(_));
                     if is_borrow {
-                        let msg = format!(
-                            "a borrow value cannot be stored in the field `{}`",
-                            t.render()
-                        );
-                        let notes = vec![
-                            "struct fields hold owned values, GC values, ids, or own-handles — never borrows (O12): a stored borrow is the shape that would force lifetime annotations".to_string(),
-                            "store the index or a copy and re-view through the handle at the use site (id discipline)".to_string(),
-                        ];
-                        self.diags.push(
-                            Diagnostic::error("HYB-E3103", self.path.clone(), t.span, msg)
-                                .with_notes(notes),
-                        );
+                        self.emit_a6_field_borrow_error(t);
                     }
+                }
+            }
+        } else if values.len() == 1 && targets.len() > 1 {
+            let shapes = self.multi_value_shapes(st, &values[0], targets.len());
+            for (t, shape) in targets.iter().zip(shapes.iter()) {
+                if matches!(t.kind, PlaceKind::Field { .. })
+                    && matches!(shape, TypeShape::BorrowHandle(_))
+                {
+                    self.emit_a6_field_borrow_error(t);
                 }
             }
         }
@@ -497,28 +505,76 @@ impl<'a> Checker<'a> {
         }
 
         // whole-binding rebind: `rows = append(rows, ...)` re-owns the value
-        if op == AssignOp::Assign && values.len() == 1 {
-            let shape = self.shape_of_expr(st, &values[0]);
-            let ty = self.ty_of_expr(st, &values[0]);
-            for t in targets {
-                if let PlaceKind::Ident(name) = &t.kind {
-                    if let Some(b) = st.env_lookup_mut(name) {
-                        b.shape = shape.clone();
-                        b.ty = ty.clone();
-                        b.moved = None; // a fresh value re-owns the binding
-                    }
-                    // rebind may create a fresh alias
-                    st.aliases.remove(name);
-                    if let Expr::Ident { name: src, .. } = &values[0] {
-                        if let Some(b) = self.lookup_binding(st, src) {
-                            if b.shape.is_reference_alias() {
-                                st.aliases.insert(name.clone(), src.clone());
-                            }
+        if op == AssignOp::Assign {
+            if targets.len() == values.len() {
+                // Evaluate RHS shapes, types, and alias sources before updating LHS bindings
+                // so parallel assignments (`m2, ok = m, true` or swaps) see pre-assign state.
+                let rhs_info: Vec<(TypeShape, Option<hy_syntax::TypeExpr>, Option<String>)> =
+                    values
+                        .iter()
+                        .map(|v| {
+                            let shape = self.shape_of_expr(st, v);
+                            let ty = self.ty_of_expr(st, v);
+                            let alias_src = if move_operand_ident(v).is_none() {
+                                if let Expr::Ident { name: src, .. } = v {
+                                    self.lookup_binding(st, src)
+                                        .filter(|b| b.shape.is_reference_alias())
+                                        .map(|_| src.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            (shape, ty, alias_src)
+                        })
+                        .collect();
+
+                for (t, (shape, ty, alias_src)) in targets.iter().zip(rhs_info) {
+                    if let PlaceKind::Ident(name) = &t.kind {
+                        if let Some(b) = st.env_lookup_mut(name) {
+                            b.shape = shape;
+                            b.ty = ty;
+                            b.moved = None; // a fresh value re-owns the binding
                         }
+                        // rebind may create a fresh alias
+                        st.aliases.remove(name);
+                        if let Some(src) = alias_src {
+                            st.aliases.insert(name.clone(), src);
+                        }
+                    }
+                }
+            } else if values.len() == 1 && targets.len() > 1 {
+                let shapes = self.multi_value_shapes(st, &values[0], targets.len());
+                let tys = self.multi_value_tys(st, &values[0], targets.len());
+                for ((t, shape), ty) in targets.iter().zip(shapes).zip(tys) {
+                    if let PlaceKind::Ident(name) = &t.kind {
+                        if let Some(b) = st.env_lookup_mut(name) {
+                            if !matches!(shape, TypeShape::Unknown) {
+                                b.shape = shape;
+                                b.ty = ty;
+                            }
+                            b.moved = None; // a fresh value re-owns the binding
+                        }
+                        st.aliases.remove(name);
                     }
                 }
             }
         }
+    }
+
+    fn emit_a6_field_borrow_error(&mut self, t: &Place) {
+        let msg = format!(
+            "a borrow value cannot be stored in the field `{}`",
+            t.render()
+        );
+        let notes = vec![
+            "struct fields hold owned values, GC values, ids, or own-handles — never borrows (O12): a stored borrow is the shape that would force lifetime annotations".to_string(),
+            "store the index or a copy and re-view through the handle at the use site (id discipline)".to_string(),
+        ];
+        self.diags.push(
+            Diagnostic::error("HYB-E3103", self.path.clone(), t.span, msg).with_notes(notes),
+        );
     }
 
     /// The shape of an assignment place, when it resolves (drives the N1
@@ -691,3 +747,133 @@ impl<'a> Checker<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{check_file, Verdict};
+
+    fn check(src: &str) -> crate::CheckResult {
+        let ast = hy_syntax::parse_file("test.hy", src).expect("test source must parse");
+        check_file(&ast)
+    }
+
+    #[test]
+    fn multi_return_assign_preserves_second_result_shape_and_rejects_spawn() {
+        let r = check(
+            "fn make_pair() (int, map[string]int) {\n\
+               m := map[string]int{\"init\": 0}\n\
+               return 1, m\n\
+             }\n\
+             fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"init\": 0}\n\
+               n := 0\n\
+               n, m = make_pair()\n\
+               task worker(m)\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3001");
+        assert!(r.diagnostics[0].message.contains("map[string]int"));
+    }
+
+    #[test]
+    fn multi_return_define_tracks_reference_alias_and_freezes_on_move() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn make_pair() (int, map[string]int) {\n\
+               m := map[string]int{\"init\": 0}\n\
+               return 1, m\n\
+             }\n\
+             fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               n, m := make_pair()\n\
+               m2 := m\n\
+               task worker(move m)\n\
+               m2[\"main\"] = n\n\
+               fmt.println(m2[\"main\"])\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3003");
+    }
+
+    #[test]
+    fn parallel_assign_tracks_reference_alias_and_freezes_on_move() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"init\": 0}\n\
+               m2 := map[string]int{\"other\": 0}\n\
+               ok := false\n\
+               m2, ok = m, true\n\
+               task worker(move m)\n\
+               if ok {\n\
+                 m2[\"main\"] = 1\n\
+               }\n\
+               fmt.println(m2[\"main\"])\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3003");
+    }
+
+    #[test]
+    fn parallel_assign_field_borrow_rejects_a6() {
+        let r = check(
+            "import \"serde_json\"\n\
+             struct holder {\n\
+               v serde_json.value\n\
+               ok bool\n\
+             }\n\
+             fn main() {\n\
+               doc := serde_json.parse(\"[1, 2]\")\n\
+               h := holder{v: serde_json.parse(\"[]\"), ok: false}\n\
+               h.v, h.ok = doc.array(), true\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3103");
+    }
+
+    #[test]
+    fn parallel_define_map_slot_loan_rejects_a3_insert() {
+        let r = check(
+            "import \"fmt\"\n\
+             struct svc { count int }\n\
+             fn main() {\n\
+               m := map[string]svc{\"a\": svc{count: 1}}\n\
+               s, ok := &m[\"a\"], true\n\
+               m[\"b\"] = svc{count: 2}\n\
+               if ok {\n\
+                 fmt.println(s.count)\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3102");
+    }
+
+    #[test]
+    fn multi_return_and_parallel_assign_moved_without_post_use_accepts() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn make_pair() (int, map[string]int) {\n\
+               m := map[string]int{\"init\": 0}\n\
+               return 1, m\n\
+             }\n\
+             fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"init\": 0}\n\
+               n := 0\n\
+               n, m = make_pair()\n\
+               task worker(move m)\n\
+               fmt.println(n)\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+}
+

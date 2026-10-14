@@ -325,31 +325,70 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Shapes for a multi-name define from one value (`v, ok := m[k]`).
+    /// Shapes for a multi-name define or assign from one value (`v, ok := m[k]`,
+    /// `v, ok := <-ch`, `a, b := f()`).
     pub(crate) fn multi_value_shapes(
         &self,
         st: &FnState,
         value: &Expr,
         n_names: usize,
     ) -> Vec<TypeShape> {
+        let val = crate::model::unwrap_parens(value);
         if n_names == 2 {
-            if let Expr::Index { base, .. } = value {
+            if let Expr::Index { base, .. } = val {
                 if let TypeShape::Map(_, v) = self.shape_of_expr(st, base) {
                     return vec![*v, TypeShape::Primitive]; // v, ok := m[k]
                 }
             }
             // `v, ok := <-ch` — the value is the channel's element; `ok` is
             // the receive-ok flag (a bool)
-            if let Expr::Receive { chan, .. } = value {
+            if let Expr::Receive { chan, .. } = val {
                 let elem = match self.shape_of_expr(st, chan) {
                     TypeShape::Chan(e) => *e,
                     _ => TypeShape::Unknown,
                 };
                 return vec![elem, TypeShape::Primitive];
             }
-            // `a, b := f()` and other multi-value forms: permissive
+        }
+        if let Expr::Call { callee, .. } = val {
+            if let Expr::Ident { name, .. } = crate::model::unwrap_parens(callee) {
+                if self.lookup_binding(st, name).is_none() {
+                    if let Some(f) = self.fns.get(name.as_str()) {
+                        if f.results.len() == n_names {
+                            return f
+                                .results
+                                .iter()
+                                .map(|r| self.shape_of_type(&r.ty))
+                                .collect();
+                        }
+                    }
+                }
+            }
         }
         vec![TypeShape::Unknown; n_names]
+    }
+
+    /// Declared result types for a multi-name define or assign from a single
+    /// call expression (`a, b := f()`), when statically resolvable.
+    pub(crate) fn multi_value_tys(
+        &self,
+        st: &FnState,
+        value: &Expr,
+        n_names: usize,
+    ) -> Vec<Option<TypeExpr>> {
+        let val = crate::model::unwrap_parens(value);
+        if let Expr::Call { callee, .. } = val {
+            if let Expr::Ident { name, .. } = crate::model::unwrap_parens(callee) {
+                if self.lookup_binding(st, name).is_none() {
+                    if let Some(f) = self.fns.get(name.as_str()) {
+                        if f.results.len() == n_names {
+                            return f.results.iter().map(|r| Some(r.ty.clone())).collect();
+                        }
+                    }
+                }
+            }
+        }
+        vec![None; n_names]
     }
 }
 
