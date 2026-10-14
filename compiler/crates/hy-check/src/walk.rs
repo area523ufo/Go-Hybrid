@@ -27,6 +27,16 @@ use std::collections::HashMap;
 // Flat statement list + structural facts (Pass A)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub(crate) enum ScopeEvent<'a> {
+    Push,
+    Pop,
+    SelectRecv {
+        names: &'a [String],
+        chan: &'a Expr,
+    },
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FlatInfo<'a> {
     /// every statement, pre-order, with its index
@@ -39,26 +49,27 @@ pub(crate) struct FlatInfo<'a> {
     /// binding name -> last statement index referencing it
     pub last_use: HashMap<String, usize>,
     /// Scope events keyed by statement index (issue #14): applied BEFORE
-    /// the statement is processed — (push, pop). A Push opens a block
-    /// scope (defines inside it die at the matching Pop); a construct's
-    /// Pop lands on the NEXT statement's index, or past the end when the
-    /// construct ends the function (that mark lands past the last statement
-    /// index and is simply never applied). Scopes follow Go's rules: one implicit
-    /// scope per if (init + cond; the then/else bodies get their own), per
-    /// for (the loop vars; the body gets its own), per managed body, and
-    /// per match/select arm body and bare block.
-    pub events: HashMap<usize, (bool, bool)>,
+    /// the statement is processed, in order. Multiple events at the same
+    /// index (e.g. when a nested construct and its enclosing `if`/`for`
+    /// end at the same index) are preserved in sequence so every `Push`
+    /// has a matching `Pop`.
+    pub events: HashMap<usize, Vec<ScopeEvent<'a>>>,
     next: usize,
 }
 
 impl<'a> FlatInfo<'a> {
     fn mark(&mut self, idx: usize, push: bool, pop: bool) {
-        if !push && !pop {
-            return;
+        let e = self.events.entry(idx).or_default();
+        if pop {
+            e.push(ScopeEvent::Pop);
         }
-        let e = self.events.entry(idx).or_insert((false, false));
-        e.0 |= push;
-        e.1 |= pop;
+        if push {
+            e.push(ScopeEvent::Push);
+        }
+    }
+
+    fn mark_event(&mut self, idx: usize, ev: ScopeEvent<'a>) {
+        self.events.entry(idx).or_default().push(ev);
     }
 
     /// Is statement `idx` lexically inside a `managed` block (O6.1)?
@@ -139,7 +150,21 @@ fn walk_one<'a>(out: &mut FlatInfo<'a>, stmt: &'a Stmt) {
         Stmt::Block { block, .. } => scoped_block(out, block),
         Stmt::Select { arms, .. } => {
             for arm in arms {
-                scoped_block(out, &arm.body);
+                let first = out.next;
+                let mut ran = false;
+                for s in &arm.body.stmts {
+                    if !ran {
+                        out.mark_event(first, ScopeEvent::Push);
+                        if let SelectArmKind::Recv { names, chan } = &arm.kind {
+                            out.mark_event(first, ScopeEvent::SelectRecv { names, chan });
+                        }
+                        ran = true;
+                    }
+                    walk_one(out, s);
+                }
+                if ran {
+                    out.mark_event(out.next, ScopeEvent::Pop);
+                }
             }
         }
         _ => {}

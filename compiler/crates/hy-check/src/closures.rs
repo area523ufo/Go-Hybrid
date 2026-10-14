@@ -148,6 +148,7 @@ fn check_stmt_boundaries(ck: &mut Checker<'_>, st: &mut FnState, stmt: &Stmt, ma
         }
         Stmt::Select { arms, .. } => {
             for arm in arms {
+                st.scope_push();
                 match &arm.kind {
                     SelectArmKind::Send { chan, value } => {
                         let desc =
@@ -175,6 +176,8 @@ fn check_stmt_boundaries(ck: &mut Checker<'_>, st: &mut FnState, stmt: &Stmt, ma
                     }
                     SelectArmKind::Default => {}
                 }
+                check_body_boundaries(ck, st, &arm.body, managed);
+                st.scope_pop();
             }
         }
         Stmt::Managed { body, .. } => {

@@ -220,19 +220,33 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     for (stmt, idx) in &flat.stmts {
         let stmt: &Stmt = stmt;
         let idx = *idx;
-        // Issue #14: apply the statement's scope events BEFORE processing.
-        // A Push opens the block scope its defines live in; a Pop closes the
-        // scope of a construct that ended at the previous statement, which
-        // restores the outer binding (an inner `m := 1` can no longer
-        // overwrite the outer map's shape and launder it past a spawn).
-        let (push, pop) = flat.events.get(&idx).copied().unwrap_or((false, false));
-        if pop {
-            st.scope_pop();
-        }
-        if push {
-            st.scope_push();
-        }
         let managed = flat.in_managed(idx);
+        // Issue #14: apply the statement's scope events BEFORE processing, in
+        // exact order so multiple Pop/Push events at the same index never
+        // coalesce into one, and select-receive arm bindings live inside their
+        // own arm scope.
+        if let Some(evs) = flat.events.get(&idx) {
+            for ev in evs {
+                match ev {
+                    walk::ScopeEvent::Push => st.scope_push(),
+                    walk::ScopeEvent::Pop => st.scope_pop(),
+                    walk::ScopeEvent::SelectRecv { names, chan } => {
+                        let elem = match ck.shape_of_expr(&st, chan) {
+                            TypeShape::Chan(e) => *e,
+                            _ => TypeShape::Unknown,
+                        };
+                        for (i, n) in names.iter().enumerate() {
+                            let shape = if i == 0 {
+                                elem.clone()
+                            } else {
+                                TypeShape::Primitive
+                            };
+                            ck.define_binding(&mut st, n, shape, None, false, managed);
+                        }
+                    }
+                }
+            }
+        }
         if let Stmt::Managed {
             reason,
             category,
@@ -404,8 +418,8 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             },
 
             // select arms: `ch <- v` is a send check-site; `v, ok := <-ch`
-            // defines its names (Unknown — fail-closed if they later cross
-            // a boundary, O4.9: ascribe or route through a known chan).
+            // defines its names inside that arm's own scope via
+            // `ScopeEvent::SelectRecv` (see `walk.rs`).
             Stmt::Select { arms, .. } => {
                 for arm in arms {
                     match &arm.kind {
@@ -430,27 +444,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                                 targets.as_deref(),
                             );
                         }
-                        SelectArmKind::Recv { names, chan } => {
-                            // `v[, ok] := <-ch` — the value's shape is the
-                            // channel's ELEMENT when the channel resolves
-                            // (fewer unknowns); `ok` is the receive flag
-                            // (a bool). An unresolvable element stays
-                            // Unknown — fail-closed if v later crosses a
-                            // boundary (O4.9).
-                            let elem = match ck.shape_of_expr(&st, chan) {
-                                TypeShape::Chan(e) => *e,
-                                _ => TypeShape::Unknown,
-                            };
-                            for (i, n) in names.iter().enumerate() {
-                                let shape = if i == 0 {
-                                    elem.clone()
-                                } else {
-                                    TypeShape::Primitive
-                                };
-                                ck.define_binding(&mut st, n, shape, None, false, managed);
-                            }
-                        }
-                        SelectArmKind::Default => {}
+                        SelectArmKind::Recv { .. } | SelectArmKind::Default => {}
                     }
                 }
             }
@@ -1385,19 +1379,131 @@ mod tests {
     #[test]
     fn if_init_define_does_not_overwrite_outer_binding() {
         // An if-init define shares Go's if-scope; after the if, the outer
-        // binding is intact and the spawn must classify against the MAP.
+        // binding is intact and the spawn must classify against the MAP,
+        // even when the if-init variable itself shadows `m` (both the
+        // `then` body scope and the `if` scope pop at the same index).
         let r = check(
             "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
              fn main() {\n\
                m := map[string]int{\"k\": 0}\n\
-               if x := 1; x > 0 {\n\
-                 fmt.println(x)\n\
+               if m := 1; m > 0 {\n\
+                 fmt.println(m)\n\
                }\n\
                task worker(m)\n\
              }",
         );
         assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
         assert_eq!(first_error_rule(&r).as_deref(), Some("A1c"));
+        assert_eq!(r.diagnostics[0].code, "HYB-E3001");
+    }
+
+    #[test]
+    fn for_var_and_nested_block_shadow_do_not_leak_outer_map() {
+        // Both `for m in 0..1 { ... }` and `{ { m := 1; ... } }` close two
+        // nested scopes at the same statement index; neither may leave the
+        // inner `m: Primitive` scope on the stack after the construct ends.
+        let r1 = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               for m in 0..1 {\n\
+                 fmt.println(m)\n\
+               }\n\
+               task worker(m)\n\
+             }",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        assert_eq!(first_error_rule(&r1).as_deref(), Some("A1c"));
+        assert_eq!(r1.diagnostics[0].code, "HYB-E3001");
+
+        let r2 = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               { { m := 1\n fmt.println(m) } }\n\
+               task worker(m)\n\
+             }",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert_eq!(first_error_rule(&r2).as_deref(), Some("A1c"));
+        assert_eq!(r2.diagnostics[0].code, "HYB-E3001");
+    }
+
+    #[test]
+    fn select_recv_define_stays_scoped_to_its_arm() {
+        // A `select` arm receive (`m := <-ch:`) is scoped to that arm's body:
+        // it must not overwrite an outer `m` after the select or overwrite a
+        // sibling arm's `m` before that arm's body is checked.
+        let r1 = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               ch := make(chan int, 1)\n\
+               select {\n\
+               m := <-ch: { fmt.println(m) }\n\
+               }\n\
+               task worker(m)\n\
+             }",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        assert_eq!(first_error_rule(&r1).as_deref(), Some("A1c"));
+        assert_eq!(r1.diagnostics[0].code, "HYB-E3001");
+
+        let r2 = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               map_ch := make(chan map[string]int, 1)\n\
+               int_ch := make(chan int, 1)\n\
+               select {\n\
+               m := <-map_ch: { task worker(m) }\n\
+               m := <-int_ch: { fmt.println(m) }\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert_eq!(first_error_rule(&r2).as_deref(), Some("A1c"));
+        assert_eq!(r2.diagnostics[0].code, "HYB-E3001");
+    }
+
+    #[test]
+    fn closure_select_arm_body_boundaries_and_recv_scope_are_checked() {
+        // Inside a closure body (closures.rs), `Stmt::Select` must both walk
+        // each arm's body for boundary statements (`task` / `send`) and scope
+        // `SelectArmKind::Recv` defines to their arm.
+        let r1 = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               ch := make(chan int, 1)\n\
+               f := fn() {\n\
+                 select {\n\
+                 <-ch: { task worker(m) }\n\
+                 }\n\
+               }\n\
+               f()\n\
+             }",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        assert_eq!(first_error_rule(&r1).as_deref(), Some("A1c"));
+        assert_eq!(r1.diagnostics[0].code, "HYB-E3001");
+
+        let r2 = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               ch := make(chan int, 1)\n\
+               f := fn() {\n\
+                 m := map[string]int{\"k\": 0}\n\
+                 select {\n\
+                 m := <-ch: { fmt.println(m) }\n\
+                 }\n\
+                 task worker(m)\n\
+               }\n\
+               f()\n\
+             }",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert_eq!(first_error_rule(&r2).as_deref(), Some("A1c"));
+        assert_eq!(r2.diagnostics[0].code, "HYB-E3001");
     }
 
     #[test]
