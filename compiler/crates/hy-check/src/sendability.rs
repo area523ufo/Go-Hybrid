@@ -167,8 +167,12 @@ impl<'a> Checker<'a> {
             }
             Expr::SliceLit { items, .. } => self.classify_composite(st, expr, items.iter()),
             // field/index/slice reads: classify the read's shape, but honor
-            // immutable roots (views of const values stay immutable, OQ5)
+            // immutable roots when the resulting value is a value copy (views
+            // of const values that do not share reference storage stay
+            // immutable, OQ5; slice views or reference fields of a const
+            // composite share mutable Go runtime storage, #188).
             Expr::Field { .. } | Expr::Index { .. } | Expr::Slice { .. } => {
+                let shape = self.shape_of_expr(st, expr);
                 if let Some(root) = expr.root_ident() {
                     if let Some(b) = self.lookup_binding(st, root) {
                         if b.moved.is_some() {
@@ -180,12 +184,14 @@ impl<'a> Checker<'a> {
                                 risky: !b.shape.is_sendable_by_type(),
                             };
                         }
-                        if b.immutable {
+                        if b.immutable
+                            && !self.shape_may_share(&shape)
+                            && !matches!(shape, TypeShape::Unknown)
+                        {
                             return Outcome::Ok;
                         }
                     }
                 }
-                let shape = self.shape_of_expr(st, expr);
                 self.outcome_for_shape(&shape, &expr.render())
             }
             // everything else (calls, receives, arithmetic, try, paren):
@@ -217,8 +223,16 @@ impl<'a> Checker<'a> {
                 risky: !b.shape.is_sendable_by_type(),
             };
         }
-        if b.immutable {
-            return Outcome::Ok; // class 4 (let/const/const-decl)
+        // Issue #188: `const` composites carrying reference storage (maps,
+        // slices, pointers, or structs/arrays containing them) lower to
+        // runtime-mutable Go `var`s. Only `const` bindings whose runtime
+        // representation is a pure value copy (no shared reference backing)
+        // qualify for the Class-4 immutability exemption at spawn/send sites.
+        if b.immutable
+            && !self.shape_may_share(&b.shape)
+            && !matches!(b.shape, TypeShape::Unknown)
+        {
+            return Outcome::Ok; // class 4 (value-copy const)
         }
         if matches!(b.shape, TypeShape::Unknown) {
             // FAIL-CLOSED (O4.9): a binding whose type the checker could
@@ -248,6 +262,11 @@ impl<'a> Checker<'a> {
             "this {} is shared across tasks: mutable shared state must cross a boundary the checker can see (Tier-0 rule O4)",
             b.shape.noun()
         )];
+        if b.immutable {
+            notes.push(
+                "a composite `const` with reference storage lowers to a runtime-mutable Go value, so sharing it across a task or channel boundary without `managed` can race if the receiver mutates it (issue #188)".to_string(),
+            );
+        }
         if matches!(b.shape, TypeShape::Map(_, _)) {
             notes.push(
                 "as written this also panics in Go — concurrent map writes are a runtime fatal; the checker tells you earlier".to_string(),
@@ -282,9 +301,6 @@ impl<'a> Checker<'a> {
                 desc: self.managed_desc(root, b),
                 risky: !b.shape.is_sendable_by_type(),
             };
-        }
-        if b.immutable {
-            return Outcome::Ok;
         }
         if matches!(b.shape, TypeShape::Unknown) {
             // FAIL-CLOSED (O4.9): a borrow of an unproven value.
