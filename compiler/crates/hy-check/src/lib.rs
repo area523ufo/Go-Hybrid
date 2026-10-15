@@ -89,6 +89,7 @@ pub fn check_file(file: &File) -> CheckResult {
 
     build_tables(&mut ck);
     ck.check_struct_decls(); // A6: borrow-handle / pointer struct fields
+    ck.check_file_decls(); // #201: redeclarations, receiver types, array bounds, const init checks
 
     let fns: Vec<&FnDecl> = file.fns().collect();
     for f in fns {
@@ -395,9 +396,10 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         walk::own_uses(stmt, &mut uses);
         ck.check_uses(&st, &uses);
 
-        // Issue #149: `/` or `%` by a literal 0 must not be accepted —
-        // Go refuses to compile the emitted expression.
-        ck.check_stmt_const_zero_divisor(stmt);
+        // Issue #149 / #201: `/` or `%` by a literal 0, negative shift
+        // counts, incomparable `==`/`!=`, and invalid array bounds must not
+        // be accepted — Go refuses to compile the emitted expression.
+        ck.check_stmt_const_zero_divisor(&st, stmt);
 
         // Calls (A2 loan windows, A7 consumes + arg lending). A for-loop
         // ITERATE expression's borrow calls get loop-extent loans: the
